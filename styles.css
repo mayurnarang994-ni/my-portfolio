@@ -1,0 +1,6 @@
+/* tiny critical styles */
+:root{--bg:#0b0f14;--fg:#e8edf2;--acc:#64b5f6}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+main{max-width:720px;margin:4rem auto;padding:0 1rem}
+a{color:var(--acc)}
+img{display:block;margin:1rem 0}
