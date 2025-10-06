@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Integrated Calendar + Attendance (IST)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
+    h1 { margin: 0 0 6px 0; }
+    .muted { color: #666; font-size: 12px; }
+    .grid { display: grid; gap: 14px; }
+    iframe { width: 100%; height: 520px; border: 1px solid #ddd; border-radius: 8px; }
+    .bar { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
+    .inputs { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    input[type="url"], input[type="text"] { padding: 8px; min-width: 320px; }
+    input[type="file"] { padding: 4px; }
+    button { padding: 8px 12px; border: 1px solid #ccc; background: #f7f7f7; border-radius: 8px; cursor: pointer; }
+    button:hover { background: #eee; }
+    .row { display: grid; grid-template-columns: 1.2fr 0.9fr 0.9fr 0.7fr 0.9fr; gap: 10px; padding: 8px 6px; border-bottom: 1px solid #eee; }
+    .row.head { position: sticky; top: 0; background: #fafafa; font-weight: bold; }
+    .pill { padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #ccc; display: inline-block; }
+    .ok { background: #eef9ef; border-color: #9ad2a2; }
+    .miss { background: #fff0f0; border-color: #e39a9a; }
+    .pending { background: #f6f6ff; border-color: #b6b6f0; }
+    .small { font-size: 12px; }
+    .nowrap { white-space: nowrap; }
+    .okmsg { color: #2a7; }
+    .warn { color: #a44; }
+  </style>
+</head>
+<body>
+  <h1>Integrated Calendar + Attendance</h1>
+  <div class="muted">Top: live Google Calendar embed (read‑only). Below: attendance checklist from ICS feed. Timezone: IST.</div>
+
+  <div class="grid">
+    <iframe id="gcalFrame" src="https://calendar.google.com/calendar/embed?src=c_o885jgm15kn2sem5tid3k3r8g4@group.calendar.google.com&ctz=Asia%2FKolkata" title="Public Google Calendar"></iframe>
+
+    <div class="bar">
+      <div class="inputs">
+        <input id="embedUrl" type="url" value="https://calendar.google.com/calendar/embed?src=c_o885jgm15kn2sem5tid3k3r8g4@group.calendar.google.com&ctz=Asia%2FKolkata" placeholder="Paste Google Calendar embed URL">
+        <input id="icsUrl" type="url" value="https://calendar.google.com/calendar/ical/c_o885jgm15kn2sem5tid3k3r8g4@group.calendar.google.com/public/full.ics" placeholder="Or paste direct .ics URL">
+        <button id="useEmbed">Use embed → ICS</button>
+        <button id="openIcs">Open ICS</button>
+        <input id="proxyUrl" type="url" placeholder="(Optional) Proxy URL (Apps Script/CF Worker)">
+        <button id="attach">Attach ICS</button>
+        <input id="icsFile" type="file" accept=".ics">
+        <button id="loadFile">Load .ics file</button>
+      </div>
+      <div class="inputs">
+        <input id="q" type="text" placeholder="Search title...">
+        <label class="small"><input type="checkbox" id="onlyFuture">Only future</label>
+        <label class="small"><input type="checkbox" id="onlyUnmarked">Only unmarked</label>
+        <button id="exportCsv">Export CSV</button>
+      </div>
+    </div>
+
+    <div id="status" class="muted"></div>
+
+    <div class="row head">
+      <div>Title</div><div>Start (IST)</div><div>End (IST)</div><div>Status</div><div>Mark</div>
+    </div>
+    <div id="list"></div>
+  </div>
+
+<script>
+const TZ = 'Asia/Kolkata';
+let EVENTS = [];
+let SOURCE_ID = '';
+
+const $ = (id)=>document.getElementById(id);
+function setStatus(msg, ok=false, warn=false) { const el=$('status'); el.textContent=msg; el.className = 'muted ' + (ok?'okmsg':'') + (warn?'warn':''); }
+
+function embedToIcs(embed) { try { const u=new URL(embed); const src=u.searchParams.get('src'); if(src) return 'https://calendar.google.com/calendar/ical/'+encodeURIComponent(src)+'/public/full.ics'; } catch(e) {} return null; }
+
+function parseICS(text) { text = text.replace(/\r\n[ \t]/g, ''); const lines = text.split(/\r?\n/); const out=[]; let ev=null;
+  for (const line of lines) { if (line.startsWith('BEGIN:VEVENT')) { ev = {}; continue; } if (line.startsWith('END:VEVENT')) { if (ev && ev.DTSTART && ev.DTEND && ev.SUMMARY) out.push(convertEvent(ev)); ev=null; continue; } if(!ev) continue;
+    const idx = line.indexOf(':'); if (idx<0) continue; const key=line.slice(0,idx); const val=line.slice(idx+1);
+    if (key.startsWith('DTSTART')) ev.DTSTART=line;
+    else if (key.startsWith('DTEND')) ev.DTEND=line;
+    else if (key.startsWith('UID')) ev.UID=val;
+    else if (key.startsWith('SUMMARY')) ev.SUMMARY=val;
+    else if (key.startsWith('LOCATION')) ev.LOCATION=val;
+    else if (key==='URL') ev.URL=val;
+    else if (key.startsWith('DESCRIPTION')) ev.DESCRIPTION=val;
+  } return out; }
+
+function parseIcsDate(line) { const parts=line.split(':'); if(parts.length<2) return null; const head=parts[0], val=parts.slice(1).join(':').trim();
+  const params=head.split(';').slice(1); let valueType=null; params.forEach(p=>{ if(p.startsWith('VALUE=')) valueType=p.split('=')[1]; });
+  if (valueType==='DATE' || /^\d{8}$/.test(val)) { const y=+val.slice(0,4), m=+val.slice(4,6)-1, d=+val.slice(6,8); return new Date(Date.UTC(y,m,d,0,0,0)); }
+  if (val.endsWith('Z')) { const y=+val.slice(0,4), m=+val.slice(4,6)-1, d=+val.slice(6,8); const hh=+val.slice(9,11), mm=+val.slice(11,13), ss=+val.slice(13,15); return new Date(Date.UTC(y,m,d,hh,mm,ss)); }
+  const hasSec=/^\d{8}T\d{6}$/.test(val); const re=hasSec?/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/:/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})$/;
+  const m=val.match(re); if(!m) return null; const y=+m[1], mo=+m[2]-1, d=+m[3], hh=+m[4], mm=+m[5], ss=hasSec?(+m[6]):0; return new Date(y,mo,d,hh,mm,ss); }
+
+function toISTString(dt) { const fmt = new Intl.DateTimeFormat('en-GB', { timeZone:'Asia/Kolkata', weekday:'short', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:false }); return fmt.format(dt).replace(',', ''); }
+
+function extractMeetLink(ev) { const tryFields=[ev.URL, ev.LOCATION, ev.DESCRIPTION]; const re=/(https?:\/\/meet\.google\.com\/[a-z0-9-]+)/i; for(const t of tryFields) if(t && re.test(t)) return t.match(re)[1]; return ''; }
+
+function convertEvent(raw) { const s=parseIcsDate(raw.DTSTART), e=parseIcsDate(raw.DTEND); const title=(raw.SUMMARY||'').trim(); const uid=(raw.UID||title+'|'+raw.DTSTART+'|'+raw.DTEND).trim();
+  return { uid, title, startISO:s?s.toISOString():'', endISO:e?e.toISOString():'', startIST:s?toISTString(s):'', endIST:e?toISTString(e):'', meet:extractMeetLink(raw) }; }
+
+function keyFor(ev) { return 'att_'+SOURCE_ID+'_'+ev.uid+'_'+Date.parse(ev.endISO); }
+function getStatus(ev) { const v=localStorage.getItem(keyFor(ev)); if(v==='A') return 'Attended'; if(v==='M') return 'Missed'; return 'Unmarked'; }
+function setStatus(ev,s) { localStorage.setItem(keyFor(ev), s); }
+
+function pill(s) { if(s==='Attended') return '<span class="pill ok">Attended</span>'; if(s==='Missed') return '<span class="pill miss">Missed</span>'; return '<span class="pill pending">Unmarked</span>'; }
+
+function render() { const q=$('q').value.toLowerCase().trim(); const onlyFuture=$('onlyFuture').checked; const onlyUnmarked=$('onlyUnmarked').checked; const list=$('list'); list.innerHTML=''; let shown=0; EVENTS.sort((a,b)=>new Date(a.startISO)-new Date(b.startISO));
+  const now=Date.now(); for(const ev of EVENTS) { if(q && !String(ev.title).toLowerCase().includes(q)) continue; const startMs=Date.parse(ev.startISO||0); if(onlyFuture && startMs<now) continue; const s=getStatus(ev); if(onlyUnmarked && s!=='Unmarked') continue;
+    const row=document.createElement('div'); row.className='row'; row.innerHTML = `
+      <div><b>${{ev.title||''}}</b><br>${{ev.meet?`<a class="small" href="${{ev.meet}}" target="_blank">Meet link</a>`:`<span class='small muted'>No link</span>`}}</div>
+      <div class="nowrap">${{ev.startIST||''}}</div>
+      <div class="nowrap">${{ev.endIST||''}}</div>
+      <div class="status">${{pill(s)}}</div>
+      <div>
+        <label class="small"><input type="radio" name="m_${{ev.uid}}" value="A"> Attended</label>
+        <label class="small"><input type="radio" name="m_${{ev.uid}}" value="M"> Missed</label>
+        <button class="small clearBtn">Clear</button>
+      </div>`;
+    row.querySelectorAll(`input[name="m_${{ev.uid}}"]`).forEach(r=>r.addEventListener('change', ()=>{ setStatus(ev, r.value); row.querySelector('.status').innerHTML = pill(getStatus(ev)); }));
+    const stored=localStorage.getItem(keyFor(ev)); if(stored) { const r=row.querySelector(`input[value="${{stored}}"]`); if(r) r.checked=true; }
+    row.querySelector('.clearBtn').addEventListener('click', ()=>{ localStorage.removeItem(keyFor(ev)); row.querySelectorAll(`input[name="m_${{ev.uid}}"]`).forEach(x=>x.checked=false); row.querySelector('.status').innerHTML=pill(getStatus(ev)); });
+    list.appendChild(row); shown++; }
+  setStatus(`${{shown}} shown / ${{EVENTS.length}} total — Source: ${{SOURCE_ID}}`, true);
+}
+
+$('useEmbed').addEventListener('click', ()=>{ const u=$('embedUrl').value.trim(); const ics=embedToIcs(u); if(!ics) return setStatus('Could not derive ICS from embed URL', false, true); $('icsUrl').value=ics; setStatus('Derived ICS from embed URL', true); });
+$('openIcs').addEventListener('click', ()=>{ const u=$('icsUrl').value.trim(); if(!u) return setStatus('Enter ICS URL first', false, true); window.open(u, '_blank'); });
+$('attach').addEventListener('click', async ()=>{ let ics=$('icsUrl').value.trim(); if(!ics) { const fromEmbed=embedToIcs($('embedUrl').value.trim()); if(fromEmbed) ics=fromEmbed; } if(!ics) return setStatus('Provide embed or ICS URL', false, true);
+  try { SOURCE_ID = (new URL(ics)).pathname.split('/').filter(Boolean).slice(-3,-2)[0] || 'ics'; } catch(e) { SOURCE_ID='ics'; }
+  let fetchUrl = ics; const proxy=$('proxyUrl').value.trim(); if(proxy) fetchUrl = proxy + (proxy.includes('?')?'&':'?') + 'url=' + encodeURIComponent(ics);
+  setStatus('Fetching ICS…'); try { const res=await fetch(fetchUrl, {cache:'no-store'}); if(!res.ok) throw new Error('HTTP '+res.status); const text=await res.text(); EVENTS = parseICS(text); render(); } catch(e) { setStatus('Fetch blocked (CORS) or failed. Use Proxy or download ICS and Load .ics file.', false, true); }
+});
+$('loadFile').addEventListener('click', async ()=>{ const f=$('icsFile').files[0]; if(!f) return setStatus('Choose .ics file', false, true); const text=await f.text(); SOURCE_ID=f.name.replace(/\.ics$/i,''); EVENTS=parseICS(text); render(); });
+
+$('q').addEventListener('input', render); $('onlyFuture').addEventListener('change', render); $('onlyUnmarked').addEventListener('change', render);
+$('exportCsv').addEventListener('click', ()=>{ const rows=[['title','start_ist','end_ist','status','meet_link']]; EVENTS.forEach(ev=>rows.push([ev.title, ev.startIST, ev.endIST, getStatus(ev), ev.meet])); const csv=rows.map(r=>r.map(x=>`"${{String(x||'').replace(/"/g,'""')}}"`).join(',')).join('\n'); const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='attendance_export.csv'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); });
+
+// Initial defaults
+document.getElementById('gcalFrame').src = 'https://calendar.google.com/calendar/embed?src=c_o885jgm15kn2sem5tid3k3r8g4@group.calendar.google.com&ctz=Asia%2FKolkata';
+document.getElementById('embedUrl').value = 'https://calendar.google.com/calendar/embed?src=c_o885jgm15kn2sem5tid3k3r8g4@group.calendar.google.com&ctz=Asia%2FKolkata';
+document.getElementById('icsUrl').value = 'https://calendar.google.com/calendar/ical/c_o885jgm15kn2sem5tid3k3r8g4@group.calendar.google.com/public/full.ics';
+render();
+</script>
+</body>
+</html>
